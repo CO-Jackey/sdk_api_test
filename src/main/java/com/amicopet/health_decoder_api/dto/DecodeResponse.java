@@ -1,8 +1,17 @@
 package com.amicopet.health_decoder_api.dto;
 
+import io.swagger.v3.oas.annotations.media.Schema;
+
+@Schema(description = "SDK 解碼回應")
 public class DecodeResponse {
+
+    @Schema(description = "是否解碼成功", example = "true")
     private boolean success;
+
+    @Schema(description = "訊息說明", example = "解碼成功")
     private String message;
+
+    @Schema(description = "解碼後的生理數據。失敗時為 null")
     private HealthData data;
 
     public DecodeResponse(boolean success, String message) {
@@ -40,18 +49,52 @@ public class DecodeResponse {
         this.data = data;
     }
 
+    @Schema(description = "解碼後的生理數據")
     public static class HealthData {
+
+        @Schema(description = "資料時間戳（epoch ms）", example = "1716600000000")
         private long timestamp;
+
+        @Schema(description = "是否正在佩戴裝置", example = "true")
         private boolean isWearing;
+
+        @Schema(description = "心率（bpm）", example = "85")
         private int hrValue;
+
+        @Schema(description = "呼吸率（次/分）", example = "22")
         private int brValue;
+
+        @Schema(description = "RRI 心率間隔（ms）", example = "705")
         private int rriValue;
+
+        @Schema(description = "體感溫度（°C）", example = "38.5")
         private float tempValue;
+
+        @Schema(description = "步數", example = "250")
         private int stepValue;
+
+        @Schema(description = "環境濕度（%）", example = "65")
         private int humValue;
+
+        @Schema(description = "氣壓值", example = "1013")
         private int pressureValue;
+
+        @Schema(description = "電池電量（%）", example = "78")
         private int powerValue;
-        private int gyroX, gyroY, gyroZ;
+
+        @Schema(description = "陀螺儀 X 軸", example = "0")
+        private int gyroX;
+
+        @Schema(description = "陀螺儀 Y 軸", example = "0")
+        private int gyroY;
+
+        @Schema(description = "陀螺儀 Z 軸", example = "0")
+        private int gyroZ;
+
+        @Schema(
+            description = "寵物姿態。0=站立, 1=行走, 2=跑步, 3=趴下, 4=坐下, 5=靜止",
+            example = "3"
+        )
         private int petPose;
 
         // Getters and Setters
@@ -165,6 +208,24 @@ public class DecodeResponse {
 
         public void setPetPose(int petPose) {
             this.petPose = petPose;
+        }
+
+        @Override
+        public String toString() {
+            return "HealthData{" +
+                    "timestamp=" + timestamp +
+                    ", isWearing=" + isWearing +
+                    ", hrValue=" + hrValue +
+                    ", brValue=" + brValue +
+                    ", rriValue=" + rriValue +
+                    ", tempValue=" + tempValue +
+                    ", stepValue=" + stepValue +
+                    ", humValue=" + humValue +
+                    ", pressureValue=" + pressureValue +
+                    ", powerValue=" + powerValue +
+                    ", gyro=(" + gyroX + "," + gyroY + "," + gyroZ + ")" +
+                    ", petPose=" + petPose +
+                    '}';
         }
     }
 }
