@@ -146,8 +146,19 @@ public class HealthDecoderService {
      * @return 最後一次 RESULT_OK 的 HealthData snapshot（battery / wearing 已覆蓋為 payload 值）
      * @throws RuntimeException 所有封包都無 RESULT_OK 時
      */
-    public DecodeResponse.HealthData decodeMqtt(String macAddress, List<MqttDecodeRequest.DataPayload> payloads) {
-        HealthCalculate sdk = sdkInstances.computeIfAbsent(macAddress, k -> new HealthCalculate(3));
+    /**
+     * 解碼 MQTT 封包（animalType 由呼叫方傳入，不再寫死為 3）
+     *
+     * @param macAddress  裝置 MAC 位址（用於 SDK 實例快取）
+     * @param payloads    MQTT 封包列表
+     * @param animalType  動物種類（0=人類 / 1=貓 / 2=兔子 / 3=狗），由 Controller 查詢 .NET 取得
+     */
+    public DecodeResponse.HealthData decodeMqtt(String macAddress, List<MqttDecodeRequest.DataPayload> payloads, int animalType) {
+        // 若快取的 SDK 實例 animalType 與目前不符（例如裝置重新綁定不同種類的寵物），重建實例
+        HealthCalculate sdk = sdkInstances.computeIfAbsent(macAddress, k -> new HealthCalculate(animalType));
+        if (sdk.getType() != animalType) {
+            sdk.setType(animalType);
+        }
 
         DecodeResponse.HealthData lastOk = null;
         int lastBattery = 0;

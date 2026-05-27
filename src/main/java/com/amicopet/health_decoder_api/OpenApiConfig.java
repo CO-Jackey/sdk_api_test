@@ -18,8 +18,8 @@ public class OpenApiConfig {
                                 "ITRI SDK 生理數據解碼服務。\n\n" +
                                 "接收藍牙裝置的原始 Base64 封包，透過 ITRI SDK 解析後，" +
                                 "回傳心率、呼吸率、步數、溫度、濕度等生理數據。\n\n" +
-                                "**Swagger UI：** `http://localhost:8080/swagger-ui/index.html`\n\n" +
-                                "**OpenAPI JSON：** `http://localhost:8080/v3/api-docs`"
+                                "**Swagger UI：** `http://ipetsdk-g9fkcdb8etd9bbdg.japaneast-01.azurewebsites.net/swagger-ui/index.html`\n\n" +
+                                "**OpenAPI JSON：** `http://ipetsdk-g9fkcdb8etd9bbdg.japaneast-01.azurewebsites.net/v3/api-docs`"
                         )
                         .version("1.0.0")
                         .contact(new Contact()

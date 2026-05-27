@@ -1,8 +1,21 @@
 # Health Decoder API 文件
 
-> 整理日期：2026-05-25  
-> 版本：v1.0  
-> 說明：本文件描述 `health-decoder-api` 的架構、端點與整合方式。此為 POC（概念驗證）專案，用於將 ITRI 藍牙 SDK 的解碼邏輯從裝置端抽離，改由後端伺服器統一解碼。
+> 整理日期：2026-05-26  
+> 版本：v1.2  
+> 說明：本文件描述 `health-decoder-api` 的架構、端點與整合方式。
+
+---
+
+## ⚠️ 這個服務只做一件事
+
+**Health Decoder API 的唯一職責：將 ITRI SDK 的解碼邏輯包成 REST API。**
+
+| 做 ✅ | 不做 ❌ |
+|-------|--------|
+| 接收原始藍牙封包（Hex / Base64） | 不寫入資料庫 |
+| 呼叫 ITRI HealthCalculate SDK 解碼 | 不處理使用者身份驗證 |
+| 回傳結構化生理數據 | 不查詢寵物或帳號資訊 |
+| （僅 decode-mqtt）轉送解碼結果到 .NET WebAPI | 不儲存任何狀態（除了 SDK buffer） |
 
 ---
 
@@ -20,108 +33,114 @@
 
 ## 二、系統架構說明
 
+### 路徑 A：APP 端解碼（現行）
+
 ```
-App / 裝置
-  │
-  │ BLE Raw Data (bytes)
-  ▼
-health-decoder-api  (Spring Boot)
-  │  POST /api/health/decode
-  │  ・接收 Base64 編碼的原始藍牙封包
-  │  ・呼叫 ITRI HealthCalculate SDK 解碼
-  │  ・回傳結構化生理數據 (心率、呼吸率、步數...)
-  ▼
-呼叫方（App 或 WebAPI）
-  │
-  │  再將解碼後數據上傳
-  ▼
-WebAPI  POST /api/ipetdata/health-data
-  │
-  ▼
-Database (USP_PetHealthAdd → PetHealthRecords)
+BLE 裝置 ──藍牙── APP（內嵌 ITRI SDK）
+                    │ POST 解碼後數據
+                    ▼
+              .NET WebAPI  /api/ipetdata/health-data
+                    │
+                    ▼
+              DB (PetHealthRecords)
 ```
 
-**設計動機：**  
-ITRI SDK 原為 Android Java Library，APP 端直接呼叫 SDK 計算。此 POC 將 SDK 包成 REST API，未來可讓 WebAPI 直接解碼，APP 只需上傳原始 bytes，不再需要內嵌 SDK。
+### 路徑 B：MQTT 站台自動上傳（新增，透過 decode-mqtt）
+
+```
+BLE 裝置 ──藍牙── MQTT 站台（Raspberry Pi 等）
+                    │ POST 原始封包（32包 hex）
+                    ▼
+         health-decoder-api  /api/health/decode-mqtt
+                    │ 呼叫 SDK 解碼
+                    │ POST 解碼結果
+                    ▼
+              .NET WebAPI  /api/ipetdata/health-data
+                    │
+                    ▼
+              DB (PetHealthRecords)
+```
+
+### 路徑 C：開發測試用（decode / decode-multi）
+
+```
+開發者 / Swagger
+  │ POST 單包或多包
+  ▼
+health-decoder-api  /api/health/decode
+                    /api/health/decode-multi
+  │ 回傳解碼結果（不轉送 .NET）
+  ▼
+開發者查看結果
+```
 
 ---
 
-## 三、API 端點
+## 三、API 端點總覽
 
-### 3.1 健康狀態確認
+| Method | Path | 用途 | 會轉送 .NET？ |
+|--------|------|------|------------|
+| `GET` | `/api/health/ping` | 健康確認 | 否 |
+| `POST` | `/api/health/decode` | 單包解碼 | 否 |
+| `POST` | `/api/health/decode-multi` | 多包連續解碼（測試用） | 否 |
+| `DELETE` | `/api/health/reset` | 清除 SDK buffer | 否 |
+| `POST` | `/api/health/decode-mqtt` | MQTT 批次解碼 + 自動轉送 | **是** |
 
-| 項目 | 內容 |
-|------|------|
-| Method | `GET` |
-| Path | `/api/health/ping` |
-| 認證 | 無（AllowAnonymous） |
+---
 
-**Response：**
+## 四、端點詳細說明
+
+### 4.1 健康確認
+
 ```
-200 OK
-"Health Decoder API is running!"
+GET /api/health/ping
+```
+
+**輸出：**
+```
+200 OK  →  "Health Decoder API is running!"
 ```
 
 ---
 
-### 3.2 解碼生理數據（核心端點）
+### 4.2 單包解碼
 
-| 項目 | 內容 |
-|------|------|
-| Method | `POST` |
-| Path | `/api/health/decode` |
-| Content-Type | `application/json` |
-| 認證 | 無（AllowAnonymous） |
+```
+POST /api/health/decode
+```
 
-#### Request Body
+**輸入（Request Body）：**
 
 | 欄位 | 型別 | 必填 | 說明 |
 |------|------|------|------|
-| `rawData` | string | ✅ | ITRI 裝置藍牙封包的 **Base64 編碼**字串 |
-| `animalType` | int | ✅ | 動物類型：`0`=人類、`1`=貓、`2`=兔子、`3`=狗（預設 3） |
+| `rawData` | string | ✅ | 單個藍牙封包，支援 **Hex**（如 `ffb2be38...`）或 **Base64** |
+| `animalType` | int | ✅ | `0`=人類 / `1`=貓 / `2`=兔子 / `3`=狗（預設 3） |
 
-**範例：**
+> 注意：deviceId 固定為 `"default"`（所有呼叫方共用同一個 SDK buffer）
+
+**輸入範例：**
 ```json
 {
-  "rawData": "AAECBAUGB...",
+  "rawData": "ffb2be386929f02144000000fb0b2f3d",
   "animalType": 3
 }
 ```
 
-#### Response Body
+**輸出（Response Body）：**
 
 | 欄位 | 型別 | 說明 |
 |------|------|------|
-| `success` | boolean | 是否解碼成功 |
-| `message` | string | 結果訊息 |
-| `data` | HealthData | 解碼後的生理數據（成功時才有） |
+| `success` | boolean | 是否解碼成功（SDK 回傳 `RESULT_OK`） |
+| `message` | string | 結果說明文字 |
+| `data` | HealthData | 解碼後的生理數據（失敗時為 null） |
 
-#### `data` 物件欄位（HealthData）
-
-| 欄位 | 型別 | 說明 |
-|------|------|------|
-| `timestamp` | long | SDK 計算時間戳 |
-| `isWearing` | boolean | 裝置是否佩戴中 |
-| `hrValue` | int | 心率（bpm） |
-| `brValue` | int | 呼吸率（次/分） |
-| `rriValue` | int | RR Interval（ms） |
-| `tempValue` | float | 體感溫度（°C） |
-| `humValue` | int | 環境濕度（%） |
-| `stepValue` | int | 步數 |
-| `pressureValue` | int | 氣壓值 |
-| `powerValue` | int | 電池電量（%） |
-| `gyroX` | int | 陀螺儀 X 軸 |
-| `gyroY` | int | 陀螺儀 Y 軸 |
-| `gyroZ` | int | 陀螺儀 Z 軸 |
-| `petPose` | int | 寵物姿態（SDK 原始整數值） |
-
-**成功範例：**
+**輸出範例（成功）：**
 ```json
 {
   "success": true,
   "message": "解碼成功",
   "data": {
-    "timestamp": 1716600000000,
+    "timestamp": 177858985747,
     "isWearing": true,
     "hrValue": 85,
     "brValue": 22,
@@ -134,82 +153,256 @@ ITRI SDK 原為 Android Java Library，APP 端直接呼叫 SDK 計算。此 POC 
     "gyroX": 10,
     "gyroY": -5,
     "gyroZ": 3,
-    "petPose": 1
+    "petPose": 3
   }
 }
 ```
 
-**失敗範例：**
+> ⚠️ SDK 需累積 **16 包以上**才能計算出 HR / BR，單包通常 hrValue = brValue = 0。
+
+---
+
+### 4.3 多包連續解碼（測試用）
+
+```
+POST /api/health/decode-multi
+```
+
+**輸入（Request Body）：**
+
+| 欄位 | 型別 | 必填 | 說明 |
+|------|------|------|------|
+| `rawData` | string | ✅ | 同一封包，Hex 或 Base64 |
+| `animalType` | int | ✅ | 同上（0~3，預設 3） |
+| `repeatCount` | int | ✅ | 重複送入次數（建議 32~50，上限 200） |
+
+**輸入範例：**
 ```json
 {
-  "success": false,
-  "message": "rawData 不能為空"
+  "rawData": "ffb2be386929f02144000000fb0b2f3d",
+  "animalType": 3,
+  "repeatCount": 32
 }
 ```
 
----
+**輸出（Response Body）：**
 
-## 四、SDK 實例管理
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| `success` | boolean | 是否成功 |
+| `message` | string | 說明（包含送入包數） |
+| `processedCount` | int | 實際處理包數 |
+| `data` | HealthData | 解碼結果（欄位同 4.2） |
 
-- Service 層（`HealthDecoderService`）使用 `ConcurrentHashMap<deviceId, HealthCalculate>` 快取每台裝置的 SDK 實例
-- **目前 POC 版本的 deviceId 固定為 `"default"`**，尚未從請求中傳入真實 DeviceId
-- 若 `animalType` 改變，會自動呼叫 `sdk.setType()` 更新
-
-> ⚠️ 正式版需要將 `deviceId` 加入 Request Body，以確保每台裝置的 SDK 狀態互不干擾
-
----
-
-## 五、與 WebAPI 的整合關係
-
-目前 APP 端的資料流：
-
-```
-1. BLE 裝置 → App 接收 Raw Bytes
-2. App 呼叫本機 ITRI SDK 解碼
-3. App POST /api/ipetdata/health-data（將解碼後數據上傳）
-```
-
-預期改造後的資料流：
-
-```
-1. BLE 裝置 → App 接收 Raw Bytes
-2. App POST /api/health/decode（傳 rawData + animalType）
-3. health-decoder-api 回傳解碼結果
-4. App 或 WebAPI POST /api/ipetdata/health-data（儲存至 DB）
-```
-
-### WebAPI 接收端點參考（`POST /api/ipetdata/health-data`）
-
-| 欄位 | 對應 Decoder 輸出 |
-|------|------|
-| `HeartRate` | `data.hrValue` |
-| `BreathRate` | `data.brValue` |
-| `Temperature` | `data.tempValue` |
-| `Humidity` | `data.humValue` |
-| `StepCount` | `data.stepValue` |
-| `BatteryLevel` | `data.powerValue` |
-| `IsWearing` | `data.isWearing` |
-| `PetPose` | `data.petPose`（需轉為 string enum） |
+> deviceId 固定為 `"test-multi"`，可用 `DELETE /api/health/reset` 清除 buffer
 
 ---
 
-## 六、本地啟動方式
+### 4.4 清除 SDK buffer
+
+```
+DELETE /api/health/reset?deviceId=test-multi
+```
+
+**輸入（Query Param）：**
+
+| 參數 | 預設值 | 說明 |
+|------|--------|------|
+| `deviceId` | `test-multi` | 要清除的裝置 ID |
+
+**輸出：**
+```
+200 OK  →  "已清除 deviceId="test-multi" 的 SDK buffer"
+```
+
+---
+
+### 4.5 MQTT 批次解碼（核心整合端點）
+
+```
+POST /api/health/decode-mqtt
+```
+
+> 🔐 **此端點需要 API Key 認證**，請在 Header 帶上 `X-Api-Key: <secret>`
+
+**輸入（Request Header）：**
+
+| Header | 必填 | 說明 |
+|--------|------|------|
+| `X-Api-Key` | ✅ | API Key，值須與 `decoder.api.key` 設定一致 |
+
+**輸入（Request Body）：**
+
+| 欄位 | 型別 | 必填 | 說明 |
+|------|------|------|------|
+| `device_name` | string | ✅ | 裝置名稱（僅 log 用，不影響邏輯） |
+| `mac_address` | string | ✅ | 裝置 MAC 位址，同時作為 SDK 的 deviceId |
+| `data_payload` | DataPayload[] | ✅ | 每筆含 32 個原始封包 |
+
+**DataPayload 欄位：**
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| `battery_level` | int | 電量（%），直接採用，不從 SDK 取 |
+| `is_wearing` | boolean | 是否佩戴，直接採用，不從 SDK 取 |
+| `timestamp` | long | 裝置 uptime ms（非 Unix epoch），存為 DeviceTimestamp |
+| `packets` | Packet[] | 32 個原始封包（通常 n=0~31） |
+
+**Packet 欄位：**
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| `n` | int | 封包序號，依此升冪排序後再送 SDK |
+| `hex_data` | string | 16 bytes 的 Hex 字串（如 `ffb2be38...`） |
+
+**輸入範例：**
+```json
+{
+  "device_name": "iPet_FE38",
+  "mac_address": "08:F9:E0:1B:FE:38",
+  "data_payload": [{
+    "battery_level": 78,
+    "is_wearing": true,
+    "timestamp": 177858985747,
+    "packets": [
+      {"n": 0, "hex_data": "ffb2be386929f02144000000fb0b2f3d"},
+      {"n": 1, "hex_data": "ffb5be386929701444000000fb0b2fc7"}
+    ]
+  }]
+}
+```
+
+**animalType 取得流程（v2 動態化）：**
+1. 查詢記憶體快取（key = macAddress）
+2. Cache miss → 呼叫 `GET /api/pet/animal-type?macAddress=...`（.NET WebAPI）
+3. 查詢失敗或裝置未綁定 → fallback = 3（狗）
+4. 結果存入快取（服務重啟才清除）
+
+**輸出（Response Body）：**
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| `success` | boolean | 解碼是否成功 |
+| `message` | string | 結果說明 |
+| `forwardSuccess` | boolean | 轉送 .NET 是否成功（false 不影響解碼結果） |
+| `data` | HealthData | 解碼結果（欄位同 4.2，但 powerValue / isWearing 來自 payload） |
+
+**輸出範例：**
+```json
+{
+  "success": true,
+  "message": "解碼並送出成功",
+  "forwardSuccess": true,
+  "data": {
+    "hrValue": 90,
+    "brValue": 6,
+    "isWearing": true,
+    "powerValue": 78,
+    "petPose": 3,
+    ...
+  }
+}
+```
+
+**HTTP 狀態碼：**
+
+| 狀態碼 | 說明 |
+|--------|------|
+| `200` | 解碼成功（forwardSuccess 可能為 false） |
+| `400` | mac_address 或 data_payload 為空 |
+| `401` | X-Api-Key 無效或未提供 |
+| `422` | 所有 32 包均無 RESULT_OK（格式異常） |
+| `500` | 解碼過程發生例外 |
+
+---
+
+## 五、HealthData 欄位說明（decode-mqtt 輸出）
+
+| 欄位 | 型別 | 來源 | 說明 |
+|------|------|------|------|
+| `hrValue` | int | SDK | 心率（bpm） |
+| `brValue` | int | SDK | 呼吸率（次/分） |
+| `rriValue` | int | SDK | RR Interval（ms） |
+| `tempValue` | float | SDK | 體感溫度（°C） |
+| `humValue` | int | SDK | 環境濕度（%） |
+| `stepValue` | int | SDK | 步數 |
+| `pressureValue` | int | SDK | 氣壓值 |
+| `gyroX/Y/Z` | int | SDK | 陀螺儀三軸 |
+| `petPose` | int | SDK | 姿態整數值（見下方對照） |
+| `timestamp` | long | SDK | SDK 計算時間戳 |
+| `isWearing` | boolean | **payload** | ⚠️ 直接採用 data_payload.is_wearing |
+| `powerValue` | int | **payload** | ⚠️ 直接採用 data_payload.battery_level |
+
+### PetPose 整數對照
+
+| SDK 值 | 字串（送 .NET） | 說明 |
+|--------|----------------|------|
+| `0` | `walking` | 行走 |
+| `1` | `sniffing` | 嗅探 |
+| `2` | `trotting` | 小跑 |
+| `3` | `galloping` | 奔跑 |
+| `4` | `staticResting` | 靜止休息 |
+| 其他 | `null` | 未知 |
+
+---
+
+## 六、轉送到 .NET WebAPI 的欄位
+
+decode-mqtt 成功後，自動 POST 到 `application.properties` 設定的 `net.api.health.url`：
+
+| 送出欄位 | 值來源 |
+|----------|--------|
+| `DeviceId` | `mac_address`（原始字串，含冒號） |
+| `RecordTime` | `data_payload[0].timestamp` 轉換為 ISO 8601 UTC |
+| `HeartRate` | `healthData.hrValue` |
+| `BreathRate` | `healthData.brValue` |
+| `Temperature` | `healthData.tempValue` |
+| `Humidity` | `healthData.humValue` |
+| `StepCount` | `healthData.stepValue` |
+| `BatteryLevel` | `data_payload.battery_level`（非 SDK 值） |
+| `IsWearing` | `data_payload.is_wearing`（非 SDK 值） |
+| `PetPose` | `petPoseToString(healthData.petPose)`（字串） |
+| `ActivityLevel` | `null`（保留欄位） |
+| `PetMood` | `null`（保留欄位） |
+
+> 轉送失敗（網路錯誤、404 等）只印 log，**不拋例外**，decode-mqtt 仍回傳 200 和解碼結果。
+
+---
+
+## 七、SDK 實例管理
+
+- `HealthDecoderService` 用 `ConcurrentHashMap<deviceId, HealthCalculate>` 管理每台裝置的 SDK 實例
+- **decode / decode-multi** 各有固定的 deviceId（`"default"` / `"test-multi"`）
+- **decode-mqtt** 用 `mac_address` 作為 deviceId，不同裝置的 SDK buffer 互相獨立
+- SDK 為串流設計：同一 deviceId 的 buffer **跨請求保留**，需累積 16+ 包才能計算 HR/BR
+
+---
+
+## 八、本地啟動方式
 
 ```bash
-# 在專案根目錄執行
 ./gradlew bootRun
 
-# 確認服務啟動
+# 確認啟動
 curl http://localhost:8080/api/health/ping
 ```
 
+`application.properties` 需設定（三項）：
+```properties
+net.api.health.url=https://<your-webapi>.azurewebsites.net/api/ipetdata/health-data
+net.api.animal-type.url=https://<your-webapi>.azurewebsites.net/api/pet/animal-type
+decoder.api.key=<your-secret-key>
+```
+
 ---
 
-## 七、已知限制與待解決問題
+## 九、已知限制與注意事項
 
-| 問題 | 說明 |
+| 項目 | 說明 |
 |------|------|
-| DeviceId 未傳入 | 目前 Request 無 `deviceId` 欄位，SDK 實例統一用 `"default"` key，多裝置同時呼叫會共用同一個 SDK 實例 |
-| 無認證機制 | 端點為 AllowAnonymous，正式部署前需加入 API Key 或 JWT |
-| 無 DB 寫入 | 純解碼不儲存，儲存邏輯須由呼叫方處理 |
-| animalType 非持久化 | 每次請求都要帶入 animalType，無法從 DeviceId 自動對應 |
+| ~~animalType 寫死~~ | ✅ **已解決（v2）**：decode-mqtt 會查詢 .NET `GET /api/pet/animal-type`，依裝置綁定的寵物動態取得 animalType；查詢結果快取於記憶體，服務重啟後重新查詢。未綁定寵物時 fallback 為 3（狗）。 |
+| ~~無認證機制~~ | ✅ **已解決（v2）**：decode-mqtt 端點加入 API Key 驗證（Header `X-Api-Key`）。`decoder.api.key` 留空或為預設值 `CHANGE_ME_BEFORE_DEPLOY` 時，開發環境跳過驗證並列印警告。正式部署必須透過環境變數設定。 |
+| SDK buffer 不持久化 | 服務重啟後所有 SDK 實例歸零，HR/BR 需重新累積 |
+| 轉送失敗不重試 | decode-mqtt 若 .NET 轉送失敗，不會重送，資料將遺失 |
+| 單包解碼通常無 HR/BR | SDK 需 16+ 包，單包呼叫 decode 通常得到 hrValue=0 |
+| animalType 快取無 TTL | 寵物重新綁定後，快取在服務重啟前不會自動刷新（目前視為可接受的限制） |

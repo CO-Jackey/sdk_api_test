@@ -23,6 +23,7 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 @RestController
 @RequestMapping("/api/health")
@@ -38,6 +39,21 @@ public class HealthController {
 
     @Value("${net.api.health.url:}")
     private String netApiHealthUrl;
+
+    /** .NET WebAPI 查詢動物種類的端點（依 MAC 位址） */
+    @Value("${net.api.animal-type.url:}")
+    private String netApiAnimalTypeUrl;
+
+    /**
+     * API Key 防護：呼叫 decode-mqtt 的 MQTT station 必須在 Header 帶上此 Key。
+     * 值從 application.properties 的 decoder.api.key 讀取，
+     * 正式部署應透過 Azure App Service 環境變數注入。
+     */
+    @Value("${decoder.api.key:}")
+    private String decoderApiKey;
+
+    /** MAC 位址 → animalType 快取（避免每次都查 .NET，降低延遲） */
+    private final Map<String, Integer> animalTypeCache = new ConcurrentHashMap<>();
 
     private int requestCount = 0;
     private final DateTimeFormatter formatter = DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
@@ -356,11 +372,13 @@ public class HealthController {
         description = "接收 MQTT 站台送來的裝置封包（含 32 個原始封包），\n" +
                       "解碼後自動 POST 到 .NET WebAPI 寫入 PetHealthData 資料表。\n\n" +
                       "**處理流程：**\n" +
-                      "1. 依 `n` 升冪排序封包\n" +
-                      "2. 逐包呼叫 SDK `splitPackage()`，記錄每次 `RESULT_OK` 的結果\n" +
-                      "3. 以 payload 的 `battery_level` / `is_wearing` 覆蓋 SDK 值\n" +
-                      "4. 轉送 .NET API（失敗時只 log，解碼結果仍正常回傳）\n\n" +
-                      "**注意：** 目前 `animalType` 固定為 3（狗）"
+                      "1. 驗證 X-Api-Key Header\n" +
+                      "2. 查詢 .NET 取得裝置綁定寵物的 animalType（有快取，首次才查詢）\n" +
+                      "3. 依 `n` 升冪排序封包\n" +
+                      "4. 逐包呼叫 SDK `splitPackage()`，記錄每次 `RESULT_OK` 的結果\n" +
+                      "5. 以 payload 的 `battery_level` / `is_wearing` 覆蓋 SDK 值\n" +
+                      "6. 轉送 .NET API（失敗時只 log，解碼結果仍正常回傳）\n\n" +
+                      "**認證：** 需在 Request Header 帶 `X-Api-Key: <secret>`"
     )
     @ApiResponses({
         @ApiResponse(
@@ -372,11 +390,13 @@ public class HealthController {
             )
         ),
         @ApiResponse(responseCode = "400", description = "請求格式錯誤（mac_address / data_payload 為空）"),
+        @ApiResponse(responseCode = "401", description = "API Key 無效或未提供"),
         @ApiResponse(responseCode = "422", description = "所有封包均無法解碼（NO_VALID_PACKET_DECODED）"),
         @ApiResponse(responseCode = "500", description = "解碼過程發生例外")
     })
     @PostMapping("/decode-mqtt")
     public ResponseEntity<MqttDecodeResponse> decodeMqtt(
+        @org.springframework.web.bind.annotation.RequestHeader(value = "X-Api-Key", required = false) String apiKey,
         @RequestBody(
             description = "MQTT 站台送來的裝置封包",
             required = true,
@@ -403,6 +423,19 @@ public class HealthController {
         )
         @org.springframework.web.bind.annotation.RequestBody MqttDecodeRequest request
     ) {
+        // ── 1. API Key 驗證 ───────────────────────────────────────────────────────
+        // decoderApiKey 為空表示尚未設定（開發環境），跳過驗證並警告
+        if (decoderApiKey != null && !decoderApiKey.isBlank() && !decoderApiKey.equals("CHANGE_ME_BEFORE_DEPLOY")) {
+            if (apiKey == null || !decoderApiKey.equals(apiKey)) {
+                System.out.println("⛔ decode-mqtt 被拒絕：X-Api-Key 無效");
+                return ResponseEntity.status(401)
+                        .body(new MqttDecodeResponse(false, "API Key 無效或未提供"));
+            }
+        } else {
+            System.out.println("⚠️  decoder.api.key 未設定，跳過 API Key 驗證（僅開發環境應如此）");
+        }
+
+        // ── 2. 基本驗證 ───────────────────────────────────────────────────────────
         if (request.getMacAddress() == null || request.getMacAddress().isBlank()) {
             return ResponseEntity.badRequest()
                     .body(new MqttDecodeResponse(false, "mac_address 不能為空"));
@@ -415,9 +448,13 @@ public class HealthController {
         System.out.println("MQTT 解碼請求: mac=" + request.getMacAddress()
                 + " payloads=" + request.getDataPayload().size());
 
+        // ── 3. 取得 animalType（快取優先，miss 時查 .NET） ───────────────────────
+        int animalType = resolveAnimalType(request.getMacAddress());
+
+        // ── 4. 解碼 ──────────────────────────────────────────────────────────────
         DecodeResponse.HealthData healthData;
         try {
-            healthData = decoderService.decodeMqtt(request.getMacAddress(), request.getDataPayload());
+            healthData = decoderService.decodeMqtt(request.getMacAddress(), request.getDataPayload(), animalType);
         } catch (RuntimeException e) {
             if (e.getMessage() != null && e.getMessage().startsWith("NO_VALID_PACKET_DECODED")) {
                 return ResponseEntity.unprocessableEntity()
@@ -445,9 +482,11 @@ public class HealthController {
             return false;
         }
 
+        // MQTT payload 的 timestamp 是裝置開機後的 uptime（ms），不是 Unix epoch
+        // 用伺服器當前 UTC 時間作為 RecordTime，確保寫入 DB 的時間正確
         MqttDecodeRequest.DataPayload firstPayload = payloads.get(0);
         String recordTime = LocalDateTime
-                .ofInstant(Instant.ofEpochMilli(firstPayload.getTimestamp()), ZoneOffset.UTC)
+                .ofInstant(Instant.now(), ZoneOffset.UTC)
                 .format(DateTimeFormatter.ISO_DATE_TIME) + "Z";
 
         Map<String, Object> body = new HashMap<>();
@@ -463,6 +502,7 @@ public class HealthController {
         body.put("PetPose", HealthDecoderService.petPoseToString(healthData.getPetPose()));
         body.put("ActivityLevel", null);
         body.put("PetMood", null);
+        body.put("DeviceTimestamp", firstPayload.getTimestamp()); // 裝置 uptime ms，供偵錯
 
         try {
             restTemplate.postForEntity(netApiHealthUrl, body, String.class);
@@ -482,6 +522,41 @@ public class HealthController {
             case 3: return "狗";
             default: return "未知";
         }
+    }
+
+    /**
+     * 依 MAC 位址取得 animalType（快取優先）。
+     * 快取 miss 時呼叫 .NET GET /api/device/animal-type，查不到時 fallback = 3（狗）。
+     */
+    private int resolveAnimalType(String macAddress) {
+        if (animalTypeCache.containsKey(macAddress)) {
+            return animalTypeCache.get(macAddress);
+        }
+
+        int animalType = 3; // fallback：狗
+        if (netApiAnimalTypeUrl != null && !netApiAnimalTypeUrl.isBlank()) {
+            try {
+                String url = netApiAnimalTypeUrl + "?macAddress=" + macAddress;
+                @SuppressWarnings("unchecked")
+                Map<String, Object> response = restTemplate.getForObject(url, Map.class);
+                if (response != null && response.containsKey("Data")) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> data = (Map<String, Object>) response.get("Data");
+                    if (data != null && data.containsKey("AnimalType")) {
+                        animalType = (int) data.get("AnimalType");
+                        System.out.println("🐾 查詢 animalType 成功: MAC=" + macAddress
+                                + " → " + animalType + "(" + getAnimalTypeName(animalType) + ")");
+                    }
+                }
+            } catch (Exception e) {
+                System.out.println("⚠️  查詢 animalType 失敗，使用 fallback=3(狗): " + e.getMessage());
+            }
+        } else {
+            System.out.println("⚠️  net.api.animal-type.url 未設定，使用 fallback=3(狗)");
+        }
+
+        animalTypeCache.put(macAddress, animalType);
+        return animalType;
     }
 
     private String bytesToHex(byte[] bytes) {
