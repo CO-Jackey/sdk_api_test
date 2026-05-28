@@ -63,7 +63,7 @@ public class HealthDecoderService {
     private byte[] decodeRawData(String rawData) {
         String trimmed = rawData.trim();
         if (isHexString(trimmed)) {
-            System.out.println("   [Service] 偵測格式：Hex → 轉換為 bytes");
+            // System.out.println("   [Service] 偵測格式：Hex → 轉換為 bytes");
             return hexToBytes(trimmed);
         } else {
             System.out.println("   [Service] 偵測格式：Base64 → 解碼");

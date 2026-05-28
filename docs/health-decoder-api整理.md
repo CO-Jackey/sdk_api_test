@@ -1,7 +1,7 @@
 # Health Decoder API 文件
 
-> 整理日期：2026-05-26  
-> 版本：v1.2  
+> 整理日期：2026-05-27  
+> 版本：v2.0  
 > 說明：本文件描述 `health-decoder-api` 的架構、端點與整合方式。
 
 ---
@@ -73,6 +73,24 @@ health-decoder-api  /api/health/decode
   ▼
 開發者查看結果
 ```
+
+### 路徑 D：MQTT 訂閱模式（Java API 主動訂閱）
+
+```
+裝置（WiFi）
+    ↓ 發布到 MQTT Broker
+broker.hivemq.com:1883  topic=esp32
+    ↓ Java API 主動訂閱（MqttSubscriberService）
+health-decoder-api  MqttProcessingService
+    ↓ 呼叫 SDK 解碼
+HealthDecoderService.decodeMqtt()
+    ↓ POST 解碼結果
+.NET WebAPI  /api/ipetdata/health-data
+    ↓
+DB (PetHealthRecords)
+```
+
+> `mqtt.enabled=true` 時服務啟動即訂閱；`mqtt.enabled=false` 時完全不啟動，HTTP 端點不受影響（見第十章）。
 
 ---
 
@@ -287,19 +305,26 @@ POST /api/health/decode-mqtt
 | `forwardSuccess` | boolean | 轉送 .NET 是否成功（false 不影響解碼結果） |
 | `data` | HealthData | 解碼結果（欄位同 4.2，但 powerValue / isWearing 來自 payload） |
 
-**輸出範例：**
+**輸出範例（已驗證，mac_address: 08:F9:E0:1B:FE:38）：**
 ```json
 {
   "success": true,
   "message": "解碼並送出成功",
   "forwardSuccess": true,
   "data": {
-    "hrValue": 90,
-    "brValue": 6,
-    "isWearing": true,
+    "hrValue": 148,
+    "brValue": 41,
+    "wearing": true,
     "powerValue": 78,
     "petPose": 3,
-    ...
+    "rriValue": 405,
+    "tempValue": 0.0,
+    "humValue": 0,
+    "stepValue": 0,
+    "pressureValue": 11,
+    "gyroX": 0,
+    "gyroY": 0,
+    "gyroZ": 0
   }
 }
 ```
@@ -353,7 +378,7 @@ decode-mqtt 成功後，自動 POST 到 `application.properties` 設定的 `net.
 | 送出欄位 | 值來源 |
 |----------|--------|
 | `DeviceId` | `mac_address`（原始字串，含冒號） |
-| `RecordTime` | `data_payload[0].timestamp` 轉換為 ISO 8601 UTC |
+| `RecordTime` | **伺服器當前 UTC 時間**（`Instant.now()` → ISO 8601），不使用裝置 timestamp（裝置 timestamp 是開機 uptime ms，非 Unix epoch，直接轉換會得到約 1975 年的錯誤時間） |
 | `HeartRate` | `healthData.hrValue` |
 | `BreathRate` | `healthData.brValue` |
 | `Temperature` | `healthData.tempValue` |
@@ -387,11 +412,14 @@ decode-mqtt 成功後，自動 POST 到 `application.properties` 設定的 `net.
 curl http://localhost:8080/api/health/ping
 ```
 
-`application.properties` 需設定（三項）：
+`application.properties` 需設定（六項）：
 ```properties
 net.api.health.url=https://<your-webapi>.azurewebsites.net/api/ipetdata/health-data
 net.api.animal-type.url=https://<your-webapi>.azurewebsites.net/api/pet/animal-type
 decoder.api.key=<your-secret-key>
+mqtt.enabled=true
+mqtt.broker.url=tcp://broker.hivemq.com:1883
+mqtt.topic=esp32
 ```
 
 ---
@@ -406,3 +434,73 @@ decoder.api.key=<your-secret-key>
 | 轉送失敗不重試 | decode-mqtt 若 .NET 轉送失敗，不會重送，資料將遺失 |
 | 單包解碼通常無 HR/BR | SDK 需 16+ 包，單包呼叫 decode 通常得到 hrValue=0 |
 | animalType 快取無 TTL | 寵物重新綁定後，快取在服務重啟前不會自動刷新（目前視為可接受的限制） |
+
+---
+
+## 十、MQTT 訂閱設定
+
+### 設定項說明
+
+| 設定項 | 說明 | 預設值 |
+|--------|------|--------|
+| `mqtt.enabled` | `true` = 啟動時自動訂閱；`false` = 完全不啟動 | `true` |
+| `mqtt.broker.url` | MQTT Broker 連線位址 | `tcp://broker.hivemq.com:1883` |
+| `mqtt.topic` | 訂閱的 Topic 名稱 | `esp32` |
+| `mqtt.client.id` | Client ID（`${random.uuid}` 確保每次重啟唯一） | `health-decoder-${random.uuid}` |
+| `mqtt.qos` | QoS 等級（0=至多一次 / 1=至少一次 / 2=恰好一次） | `1` |
+
+> ⚠️ 修改 MQTT 設定後需**重新打包部署**（Azure App Service 重啟），環境變數方式同樣需重啟才生效。
+
+---
+
+### 情境說明
+
+#### 情境 A：換成自建 MQTT Server（EMQX / Mosquitto）
+
+只需修改 `mqtt.broker.url` 和 `mqtt.topic`，不動程式碼：
+
+```properties
+mqtt.enabled=true
+mqtt.broker.url=tcp://your-mqtt-server.com:1883
+mqtt.topic=your/topic
+```
+
+> 若自建 Broker 需要帳號密碼，需同步在 `MqttSubscriberService` 的 `doConnect()` 加入 `options.setUserName()` 和 `options.setPassword()`。
+
+#### 情境 B：切換到 EMQX Webhook 模式（推薦正式上線架構）
+
+```properties
+mqtt.enabled=false   ← 關掉 Java 直接訂閱
+```
+
+在 EMQX 設定 Rule Engine → Webhook：
+- 收到 topic `esp32` 的訊息後，HTTP POST 到 `https://.../api/health/decode-mqtt`
+- Webhook Header 帶上 `X-Api-Key: amicoipet-decoder`（或正式密鑰）
+- **Java 程式碼完全不需修改**
+
+#### 情境 C：更換 Topic 名稱
+
+只改 `mqtt.topic`，重新打包部署：
+
+```properties
+mqtt.topic=ipet/health/data
+```
+
+---
+
+### 訊息格式與錯誤處理
+
+收到任何訊息都會先完整印出原始內容：
+
+```
+📨 MQTT 原始訊息:
+  topic: esp32
+  長度: 151 bytes
+  內容: {"device_name":"iPet_FE38",...}
+```
+
+- **非本系統格式**（如其他裝置測試訊息）→ `⚠️  格式不符，略過（非本系統訊息）`
+- **本系統格式且驗證通過** → `✅ 格式正確，開始解碼` + mac + packets 筆數
+- `MqttDecodeRequest` 加了 `@JsonIgnoreProperties(ignoreUnknown = true)`，未知欄位不拋例外
+
+> ⚠️ `broker.hivemq.com` 是公開 Broker，topic `esp32` 任何人都可發布，非本系統訊息會被靜默略過。正式上線前必須換成私有 Broker。

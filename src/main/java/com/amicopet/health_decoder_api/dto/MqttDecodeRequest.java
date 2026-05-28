@@ -1,10 +1,12 @@
 package com.amicopet.health_decoder_api.dto;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import io.swagger.v3.oas.annotations.media.Schema;
 
 import java.util.List;
 
+@JsonIgnoreProperties(ignoreUnknown = true)
 @Schema(description = "MQTT 站台送來的裝置封包，含完整 32 包原始資料")
 public class MqttDecodeRequest {
 
