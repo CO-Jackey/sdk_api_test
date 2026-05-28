@@ -153,6 +153,11 @@ public class HealthDecoderService {
      * @param payloads    MQTT 封包列表
      * @param animalType  動物種類（0=人類 / 1=貓 / 2=兔子 / 3=狗），由 Controller 查詢 .NET 取得
      */
+    // SDK 的 Algorithm() 每 16 封包觸發一次，且透過 handler.post() 非同步執行。
+    // 批次送包時（MQTT 模式）迴圈速度遠快於 Algorithm 執行速度，
+    // 因此每 16 封包後需要等待 Algorithm 完成，再取快照，避免讀到舊值。
+    private static final long ALGORITHM_WAIT_MS = 50;
+
     public DecodeResponse.HealthData decodeMqtt(String macAddress, List<MqttDecodeRequest.DataPayload> payloads, int animalType) {
         // 若快取的 SDK 實例 animalType 與目前不符（例如裝置重新綁定不同種類的寵物），重建實例
         HealthCalculate sdk = sdkInstances.computeIfAbsent(macAddress, k -> new HealthCalculate(animalType));
@@ -174,16 +179,39 @@ public class HealthDecoderService {
 
             System.out.println("   [Service] MQTT 批次：" + sorted.size() + " 包，MAC=" + macAddress);
 
+            int packetIndex = 0;
             for (MqttDecodeRequest.Packet packet : sorted) {
                 try {
                     byte[] rawBytes = decodeRawData(packet.getHexData());
-                    int result = sdk.splitPackage(rawBytes);
+                    sdk.splitPackage(rawBytes);
+                    packetIndex++;
 
-                    if (result == HealthCalculate.RESULT_OK) {
-                        lastOk = snapshotHealthData(sdk);
+                    // 每 16 封包後等待非同步 Algorithm 完成，再取快照
+                    if (packetIndex % 16 == 0) {
+                        Thread.sleep(ALGORITHM_WAIT_MS);
+                        DecodeResponse.HealthData snapshot = snapshotHealthData(sdk);
+                        if (snapshot != null) {
+                            lastOk = snapshot;
+                            System.out.println("   [Service] 第 " + packetIndex + " 筆快照: HR=" + snapshot.getHrValue()
+                                    + " BR=" + snapshot.getBrValue());
+                        }
                     }
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    System.out.println("   [Service] ⚠️ sleep 被中斷");
                 } catch (Exception e) {
                     System.out.println("   [Service] ⚠️ 封包 n=" + packet.getN() + " 解析失敗: " + e.getMessage());
+                }
+            }
+
+            // 若封包數不是 16 的倍數，補一次等待確保最後一批 Algorithm 完成
+            if (packetIndex % 16 != 0) {
+                try {
+                    Thread.sleep(ALGORITHM_WAIT_MS);
+                    DecodeResponse.HealthData snapshot = snapshotHealthData(sdk);
+                    if (snapshot != null) lastOk = snapshot;
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
                 }
             }
         }
